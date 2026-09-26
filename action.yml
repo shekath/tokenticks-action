@@ -1,1 +1,145 @@
+name: TokenTicks prompt cost check
+description: Lint prompt files and post the monthly cost change of a pull request's prompt edits as a comment.
+author: TokenTicks
+branding:
+  icon: dollar-sign
+  color: blue
 
+inputs:
+  key:
+    description: >
+      TokenTicks licence key (store it as a secret). Without one, the free checks
+      run (token budgets) and no cost comment is posted. Pro adds waste and
+      cache-order findings; Team adds the cost comment.
+    required: false
+    default: ""
+  lint:
+    description: Run `tokenticks lint` and annotate the changed files.
+    required: false
+    default: "true"
+  fail-on-lint:
+    description: Fail the job when lint reports an error-level finding.
+    required: false
+    default: "true"
+  comment:
+    description: Post (or update) one cost comment on the pull request. Team plan.
+    required: false
+    default: "true"
+  base:
+    description: Ref to compare against. Defaults to the pull request's base branch.
+    required: false
+    default: ""
+  config:
+    description: Path to a .tokenticks.json config file. Defaults to ./.tokenticks.json when present.
+    required: false
+    default: ""
+  working-directory:
+    description: Directory to run in.
+    required: false
+    default: "."
+  version:
+    description: tokenticks npm package version to run.
+    required: false
+    default: "0"
+  github-token:
+    description: Token used to post the comment.
+    required: false
+    default: ${{ github.token }}
+
+outputs:
+  monthly-delta-usd:
+    description: Change in monthly cost from this pull request's prompt edits, in USD (empty when no cost check ran).
+    value: ${{ steps.diff.outputs.delta }}
+  comment-file:
+    description: Path of the Markdown cost comment, when one was produced.
+    value: ${{ steps.diff.outputs.file }}
+
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-node@v7
+      with:
+        node-version: 22
+
+    # diff compares against the merge base, which a shallow checkout does not
+    # have. Fetch what is missing rather than asking every user for
+    # fetch-depth: 0.
+    - name: Fetch the base branch
+      if: github.event_name == 'pull_request' || github.event_name == 'pull_request_target' || inputs.base != ''
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        BASE: ${{ inputs.base }}
+      run: |
+        ref="${BASE:-$GITHUB_BASE_REF}"
+        ref="${ref#origin/}"
+        [ -n "$ref" ] || exit 0
+        if [ "$(git rev-parse --is-shallow-repository)" = "true" ]; then
+          git fetch --no-tags --quiet --unshallow origin || true
+        fi
+        git fetch --no-tags --quiet origin "+refs/heads/$ref:refs/remotes/origin/$ref" || true
+
+    - name: Lint prompts
+      if: inputs.lint == 'true'
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        TOKENTICKS_KEY: ${{ inputs.key }}
+        CONFIG: ${{ inputs.config }}
+        FAIL: ${{ inputs.fail-on-lint }}
+        VERSION: ${{ inputs.version }}
+      run: |
+        args=(lint --format github)
+        [ -n "$CONFIG" ] && args+=(--config "$CONFIG")
+        status=0
+        npx -y "tokenticks@$VERSION" "${args[@]}" || status=$?
+        if [ "$status" -eq 1 ] && [ "$FAIL" != "true" ]; then
+          echo "::notice::tokenticks lint found errors; fail-on-lint is off, so the job continues."
+          exit 0
+        fi
+        exit "$status"
+
+    - name: Price the change
+      id: diff
+      if: always() && inputs.comment == 'true' && (github.event_name == 'pull_request' || github.event_name == 'pull_request_target' || inputs.base != '')
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        TOKENTICKS_KEY: ${{ inputs.key }}
+        CONFIG: ${{ inputs.config }}
+        BASE: ${{ inputs.base }}
+        VERSION: ${{ inputs.version }}
+      run: |
+        args=(diff)
+        [ -n "$BASE" ] && args+=(--base "$BASE")
+        [ -n "$CONFIG" ] && args+=(--config "$CONFIG")
+        md="$RUNNER_TEMP/tokenticks-cost.md"
+        json="$RUNNER_TEMP/tokenticks-cost.json"
+        rm -f "$md" "$json"
+        # Without a Team key diff prints a note to stderr and writes no file,
+        # so nothing below posts an upsell on the pull request.
+        npx -y "tokenticks@$VERSION" "${args[@]}" --format markdown --output "$md" > /dev/null
+        if [ -s "$md" ]; then
+          npx -y "tokenticks@$VERSION" "${args[@]}" --format json --output "$json" > /dev/null
+          delta="$(node -e 'console.log(JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")).deltaMonthlyUsd)' "$json")"
+          echo "file=$md" >> "$GITHUB_OUTPUT"
+          echo "delta=$delta" >> "$GITHUB_OUTPUT"
+          cat "$md" >> "$GITHUB_STEP_SUMMARY"
+        fi
+
+    - name: Comment on the pull request
+      if: always() && steps.diff.outputs.file != '' && github.event.pull_request.number
+      uses: actions/github-script@v9
+      env:
+        COST_FILE: ${{ steps.diff.outputs.file }}
+      with:
+        github-token: ${{ inputs.github-token }}
+        script: |
+          const body = require('fs').readFileSync(process.env.COST_FILE, 'utf8');
+          const marker = '<!-- tokenticks-diff -->';
+          const { owner, repo } = context.repo;
+          const issue_number = context.payload.pull_request.number;
+          const comments = await github.paginate(github.rest.issues.listComments, { owner, repo, issue_number });
+          const mine = comments.find((c) => c.body && c.body.includes(marker));
+          if (mine) await github.rest.issues.updateComment({ owner, repo, comment_id: mine.id, body });
+          else await github.rest.issues.createComment({ owner, repo, issue_number, body });
